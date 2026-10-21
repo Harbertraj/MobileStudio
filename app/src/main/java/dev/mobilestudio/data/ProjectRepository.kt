@@ -35,12 +35,12 @@ class ProjectRepository(private val root: File) {
     fun projects(): List<File> =
         root.listFiles { f -> f.isDirectory }?.sortedBy { it.name.lowercase() } ?: emptyList()
 
-    fun createProject(name: String, packageName: String): Result<File> = runCatching {
+    fun createProject(name: String, packageName: String, language: Language = Language.KOTLIN): Result<File> = runCatching {
         requireValidName(name)
         require(PACKAGE_REGEX.matches(packageName)) { "Invalid package name: $packageName" }
         val dir = requireInside(File(root, name))
         require(!dir.exists()) { "Project already exists" }
-        Templates.emptyActivity(name, packageName).forEach { (path, content) ->
+        Templates.create(language, name, packageName).forEach { (path, content) ->
             val target = requireInside(File(dir, path))
             target.parentFile?.mkdirs()
             target.writeText(content)

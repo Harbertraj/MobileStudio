@@ -1,6 +1,41 @@
 package dev.mobilestudio.data
 
+enum class Language { KOTLIN, JAVA }
+
 object Templates {
+
+    fun create(language: Language, appName: String, packageName: String): Map<String, String> =
+        when (language) {
+            Language.KOTLIN -> emptyActivity(appName, packageName)
+            Language.JAVA -> emptyActivityJava(appName, packageName)
+        }
+
+    /** Same project as [emptyActivity] but with a Java activity and no Kotlin plugin. */
+    fun emptyActivityJava(appName: String, packageName: String): Map<String, String> {
+        val pkgPath = packageName.replace('.', '/')
+        val files = LinkedHashMap(emptyActivity(appName, packageName))
+        files.remove("app/src/main/java/$pkgPath/MainActivity.kt")
+        files["app/build.gradle.kts"] = files.getValue("app/build.gradle.kts").replace("    id(\"org.jetbrains.kotlin.android\")\n", "")
+        files["app/src/main/java/$pkgPath/MainActivity.java"] = """
+            package $packageName;
+
+            import android.app.Activity;
+            import android.os.Bundle;
+            import android.widget.TextView;
+
+            public class MainActivity extends Activity {
+                @Override
+                protected void onCreate(Bundle savedInstanceState) {
+                    super.onCreate(savedInstanceState);
+                    TextView view = new TextView(this);
+                    view.setText("Hello from $appName");
+                    setContentView(view);
+                }
+            }
+        """.trimIndent() + "\n"
+        return files
+    }
+
 
     /** Relative path to file content for a minimal single-activity Kotlin app. */
     fun emptyActivity(appName: String, packageName: String): Map<String, String> {

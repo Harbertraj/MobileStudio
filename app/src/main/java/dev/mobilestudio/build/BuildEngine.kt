@@ -3,47 +3,57 @@ package dev.mobilestudio.build
 import java.io.File
 
 sealed interface BuildResult {
-    data object Success : BuildResult
+    data class Success(val apk: File) : BuildResult
     data class Failure(val reason: String) : BuildResult
 }
 
-/**
- * Turns a project directory into an installable APK.
- *
- * A real implementation runs, on-device: aapt2 (compile + link resources), a Kotlin/Java
- * compiler, d8 (dex), then zip-align and apk signing. Those native/JVM tools must be shipped
- * with the app; that is the major remaining piece of work.
- */
+/** Turns a project directory into an installable APK. */
 interface BuildEngine {
     suspend fun build(project: File, log: (String) -> Unit): BuildResult
+    fun cancel()
 }
 
 /**
- * Placeholder engine: checks the project structure and reports what a real build would do.
- * It does not produce an APK.
+ * Runs the standard pipeline: toolchain check, config, manifest, aapt2 compile/link,
+ * source compile, dex, package, sign. Compiler and dexer are supplied by the caller.
  */
-class ProjectCheckEngine : BuildEngine {
+class PipelineBuildEngine(
+    private val toolchain: () -> Toolchain,
+    private val workRoot: File,
+    private val outputDir: File,
+    private val compiler: SourceCompiler,
+    private val dexer: Dexer,
+    private val signer: ApkSigning,
+    private val runner: ProcessRunner = JvmProcessRunner(),
+) : BuildEngine {
+
+    @Volatile private var cancelled = false
+
+    override fun cancel() { cancelled = true }
 
     override suspend fun build(project: File, log: (String) -> Unit): BuildResult {
-        log("> Checking project ${project.name}")
+        cancelled = false
+        val ctx = BuildContext(
+            project = project,
+            workDir = workDirFor(workRoot, project).also { it.mkdirs() },
+            toolchain = toolchain(),
+            runner = runner,
+            log = log,
+            isCancelled = { cancelled },
+        )
+        return BuildPipeline(
+            listOf(
+                CheckToolchainStep(), ReadConfigStep(), PatchManifestStep(),
+                Aapt2CompileStep(), Aapt2LinkStep(),
+                CompileSourcesStep(compiler), DexStep(dexer),
+                PackageApkStep(), SignApkStep(signer, outputDir),
+            )
+        ).run(ctx)
+    }
 
-        val manifest = File(project, "app/src/main/AndroidManifest.xml")
-        if (!manifest.isFile) return BuildResult.Failure("Missing app/src/main/AndroidManifest.xml")
-        log("  manifest found")
-
-        val sources = File(project, "app/src/main/java").walkTopDown()
-            .filter { it.isFile && it.extension in setOf("kt", "java") }
-            .toList()
-        if (sources.isEmpty()) return BuildResult.Failure("No Kotlin or Java sources under app/src/main/java")
-        log("  ${sources.size} source file(s)")
-
-        val resources = File(project, "app/src/main/res").walkTopDown().count { it.isFile }
-        log("  $resources resource file(s)")
-
-        log("> aapt2 compile/link: not implemented")
-        log("> compile Kotlin/Java: not implemented")
-        log("> d8 dexing: not implemented")
-        log("> sign and package APK: not implemented")
-        return BuildResult.Failure("Structure check passed, but the on-device toolchain is not implemented yet")
+    companion object {
+        /** Folder names alone can collide (two projects called "App"), so the path is part of the name. */
+        fun workDirFor(workRoot: File, project: File): File =
+            File(workRoot, "${project.name}-${Integer.toHexString(project.canonicalPath.hashCode())}")
     }
 }
