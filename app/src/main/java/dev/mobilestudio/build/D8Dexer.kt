@@ -8,7 +8,7 @@ import com.android.tools.r8.OutputMode
 import java.io.File
 
 /**
- * Converts class files (and library jars) to dex with D8. Debug mode: fastest, no shrinking.
+ * Converts class files (and library jars) to dex with D8. Debug builds keep debug info; release builds use D8's optimised mode (no shrinking or obfuscation).
  * Not run here: the R8/D8 library could not be downloaded in the build environment.
  */
 class D8Dexer : Dexer {
@@ -24,7 +24,7 @@ class D8Dexer : Dexer {
                 .addProgramFiles(classFiles + ctx.toolchain.libs.map { it.toPath() })
                 .addLibraryFiles(ctx.toolchain.androidJar.toPath())
                 .setMinApiLevel(config.minSdk)
-                .setMode(CompilationMode.DEBUG)
+                .setMode(if (ctx.variant == BuildVariant.RELEASE) CompilationMode.RELEASE else CompilationMode.DEBUG)
                 .setOutput(outDir.toPath(), OutputMode.DexIndexed)
                 .build()
             D8.run(command)

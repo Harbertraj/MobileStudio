@@ -13,6 +13,35 @@ class CheckToolchainStep : BuildStep {
     }
 }
 
+/** Downloads whatever tools are missing (aapt2, android.jar, kotlin-stdlib) before the build needs them. */
+fun interface ToolchainSetup {
+    fun ensure(config: AppConfig, needsKotlin: Boolean, log: (String) -> Unit): StepResult
+}
+
+class PrepareToolchainStep(
+    private val setup: ToolchainSetup,
+    private val refresh: () -> Toolchain,
+) : BuildStep {
+    override val name = "Prepare toolchain"
+    override fun run(ctx: BuildContext): StepResult {
+        val config = ctx.config ?: return fail("configuration was not read")
+        if (ctx.toolchain.problems().isEmpty() && !needsKotlinStdlib(ctx)) {
+            ctx.log("  toolchain ready")
+            return StepResult.Ok
+        }
+        val result = setup.ensure(config, hasKotlinSources(ctx), ctx.log)
+        // Files were added behind the toolchain's back: look again.
+        ctx.toolchain = refresh()
+        return result
+    }
+
+    private fun needsKotlinStdlib(ctx: BuildContext) =
+        hasKotlinSources(ctx) && ctx.toolchain.libs.none { it.name.startsWith("kotlin-stdlib") }
+
+    private fun hasKotlinSources(ctx: BuildContext): Boolean =
+        listOf("java", "kotlin").any { d -> ctx.mainDir.resolve(d).walkTopDown().any { it.isFile && it.extension == "kt" } }
+}
+
 class ReadConfigStep : BuildStep {
     override val name = "Read project configuration"
     override fun run(ctx: BuildContext): StepResult {
@@ -107,14 +136,17 @@ class PackageApkStep : BuildStep {
     }
 }
 
-class SignApkStep(private val signer: ApkSigning, private val outputDir: File) : BuildStep {
+class SignApkStep(private val signerFor: (BuildContext) -> ApkSigning, private val outputDir: File) : BuildStep {
+    constructor(signer: ApkSigning, outputDir: File) : this({ _ -> signer }, outputDir)
+
     override val name = "Sign APK"
     override fun run(ctx: BuildContext): StepResult {
         val unsigned = ctx.unsignedApk ?: return fail("APK was not packaged")
         val config = ctx.config ?: return fail("configuration was not read")
         outputDir.mkdirs()
-        val out = File(outputDir, "${ctx.project.name}-debug.apk")
-        val result = signer.sign(unsigned, out, config)
+        val out = File(outputDir, "${ctx.project.name}-${ctx.variant.label}.apk")
+        val signer = try { signerFor(ctx) } catch (e: Exception) { return fail(e.message ?: "signing is not available") }
+        val result = try { signer.sign(unsigned, out, config) } catch (e: Exception) { return fail("${e.javaClass.simpleName}: ${e.message}") }
         if (result is StepResult.Fail) return result
         ctx.signedApk = out
         return StepResult.Ok

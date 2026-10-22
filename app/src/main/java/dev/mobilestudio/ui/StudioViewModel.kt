@@ -5,8 +5,17 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import android.content.Context
 import android.os.Environment
+import dev.mobilestudio.build.ApkExport
+import dev.mobilestudio.build.ApkInstaller
 import dev.mobilestudio.build.ApkSignerAdapter
 import dev.mobilestudio.build.BuildEngine
+import dev.mobilestudio.build.BuildVariant
+import dev.mobilestudio.build.KeyApkSigner
+import dev.mobilestudio.build.ReleaseKeystore
+import dev.mobilestudio.build.StepResult
+import dev.mobilestudio.build.ToolchainInstaller
+import dev.mobilestudio.build.ToolchainSetup
+import dev.mobilestudio.build.ToolchainSources
 import dev.mobilestudio.build.BuildResult
 import dev.mobilestudio.build.D8Dexer
 import dev.mobilestudio.build.EcjJavaRunner
@@ -29,6 +38,10 @@ import dev.mobilestudio.editor.TextPositions
 import dev.mobilestudio.editor.UndoStack
 import dev.mobilestudio.terminal.BuiltinCommand
 import dev.mobilestudio.terminal.CommandHistory
+import dev.mobilestudio.terminal.GitCredential
+import dev.mobilestudio.terminal.GitRunner
+import dev.mobilestudio.terminal.GitSettings
+import dev.mobilestudio.terminal.ShellCwd
 import dev.mobilestudio.terminal.ShellSession
 import dev.mobilestudio.terminal.TerminalBuffer
 import dev.mobilestudio.terminal.TerminalCommands
@@ -102,13 +115,45 @@ data class StudioState(
     val folderPicker: FolderPickerState? = null,
     val toolchain: ToolchainInfo = ToolchainInfo(),
     val toolchainDialog: Boolean = false,
+    /** True while missing tools are being downloaded; [toolchainLog] shows how far it got. */
+    val toolchainBusy: Boolean = false,
+    val toolchainLog: List<String> = emptyList(),
+    val aapt2Url: String = "",
     val terminal: TerminalState = TerminalState(),
     val message: String? = null,
 )
 
 class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
-    private companion object { const val PREF_RECENT = "recent_folders" }
+    private companion object {
+        const val PREF_RECENT = "recent_folders"
+        const val PREF_AAPT2_URL = "aapt2_url"
+        const val PREF_GIT_HOSTS = "git_hosts"
+    }
+
+    /** Git credentials live in this app's private preferences; `~/.gitconfig` is in the app's home folder. */
+    private val gitSettings = object : GitSettings {
+        override val home: File = File(app.filesDir, "home").also { it.mkdirs() }
+        private fun hostSet(): Set<String> = prefs.getStringSet(PREF_GIT_HOSTS, emptySet()).orEmpty()
+        override fun credential(host: String): GitCredential? {
+            val h = host.lowercase()
+            val user = prefs.getString("git_user_$h", null) ?: return null
+            val token = prefs.getString("git_token_$h", null) ?: return null
+            return GitCredential(user, token)
+        }
+        override fun saveCredential(host: String, user: String, token: String) {
+            val h = host.lowercase()
+            prefs.edit().putString("git_user_$h", user).putString("git_token_$h", token)
+                .putStringSet(PREF_GIT_HOSTS, hostSet() + h).apply()
+        }
+        override fun removeCredential(host: String): Boolean {
+            val h = host.lowercase()
+            if (h !in hostSet()) return false
+            prefs.edit().remove("git_user_$h").remove("git_token_$h").putStringSet(PREF_GIT_HOSTS, hostSet() - h).apply()
+            return true
+        }
+        override fun hosts(): List<String> = hostSet().sorted()
+    }
 
 
     private val app: Application = app
@@ -131,6 +176,24 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    private val releaseKeystore = ReleaseKeystore(File(app.filesDir, "signing"))
+
+    private fun toolSources() = ToolchainSources(aapt2Url = prefs.getString(PREF_AAPT2_URL, null)?.takeIf { it.isNotBlank() })
+
+    private val toolchainInstaller = ToolchainInstaller(
+        store = toolchainStore,
+        sources = ::toolSources,
+        aapt2Provided = { File(app.applicationInfo.nativeLibraryDir, "libaapt2.so").isFile },
+    )
+
+    /** Downloads whatever the build is missing. Runs as the "Prepare toolchain" build step. */
+    private val toolchainSetup = ToolchainSetup { config, needsKotlin, log ->
+        toolchainInstaller.ensure(config.compileSdk, needsKotlin, log).fold(
+            onSuccess = { StepResult.Ok },
+            onFailure = { StepResult.Fail(it.message ?: "download failed") },
+        )
+    }
+
     private val engine: BuildEngine = PipelineBuildEngine(
         toolchain = ::currentToolchain,
         workRoot = File(app.cacheDir, "build"),
@@ -138,6 +201,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         compiler = JvmSourceCompiler(K2KotlinRunner(), EcjJavaRunner()),
         dexer = D8Dexer(),
         signer = ApkSignerAdapter(keystore = { KeystoreAsset.decode(app.assets.open("debug.p12.b64").use { it.readBytes() }).inputStream() }),
+        releaseSigner = { project, log -> KeyApkSigner { releaseKeystore.load(project, log) } },
+        toolchainSetup = toolchainSetup,
     )
 
     private val _state = MutableStateFlow(
@@ -145,6 +210,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             projects = workspace.projects(),
             recent = RecentFolders.prune(RecentFolders.decode(prefs.getString(PREF_RECENT, null))).map(::File),
             toolchain = readToolchainInfo(),
+            aapt2Url = prefs.getString(PREF_AAPT2_URL, "").orEmpty(),
         )
     )
     val state: StateFlow<StudioState> = _state.asStateFlow()
@@ -280,6 +346,27 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             result.onSuccess { toast("Imported ${it.name}") }.onFailure { toast(it.message) }
             _state.update { it.copy(toolchain = readToolchainInfo()) }
         }
+    }
+
+    /** "Download missing tools" in the toolchain dialog. */
+    fun downloadToolchain() {
+        if (_state.value.toolchainBusy) return
+        _state.update { it.copy(toolchainBusy = true, toolchainLog = emptyList()) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val compileSdk = projectCompileSdk()
+            val result = toolchainInstaller.ensure(compileSdk, needsKotlin = true) { line ->
+                _state.update { it.copy(toolchainLog = it.toolchainLog + line) }
+            }
+            val summary = result.fold({ "Done: the toolchain is ready." }, { "Could not finish:\n${it.message}" })
+            _state.update { it.copy(toolchainBusy = false, toolchainLog = it.toolchainLog + summary, toolchain = readToolchainInfo()) }
+        }
+    }
+
+    /** A custom aapt2 download address (a .zip/.tar.gz containing aapt2, or the binary itself). Empty clears it. */
+    fun setAapt2Url(url: String) {
+        val clean = url.trim()
+        prefs.edit().putString(PREF_AAPT2_URL, clean).apply()
+        _state.update { it.copy(aapt2Url = clean) }
     }
 
     fun removeLib(name: String) {
@@ -530,24 +617,42 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- build ----------------------------------------------------------------------------
 
-    fun build() {
+    fun build() = build(BuildVariant.DEBUG)
+
+    /** [toTerminal]: also print the build log in the terminal (when `build` was typed there). */
+    fun build(variant: BuildVariant, toTerminal: Boolean = false) {
         val project = _state.value.project ?: return
-        if (_state.value.building) return
+        if (_state.value.building) { if (toTerminal) termPrint("A build is already running.\n"); return }
         _state.update { it.copy(building = true, buildLog = emptyList(), builtApk = null) }
         viewModelScope.launch(Dispatchers.IO) {
+            fun emit(line: String) {
+                _state.update { it.copy(buildLog = it.buildLog + line) }
+                if (toTerminal) termPrint(line + "\n")
+            }
             saveAllNow()
             val result = try {
-                engine.build(project) { line -> _state.update { it.copy(buildLog = it.buildLog + line) } }
+                engine.build(project, variant) { line -> emit(line) }
             } catch (e: Throwable) {
                 BuildResult.Failure("${e.javaClass.simpleName}: ${e.message}")
             }
+            var exported: File? = null
             val (summary, apk) = when (result) {
-                is BuildResult.Success -> "BUILD SUCCESSFUL: ${result.apk.name}" to result.apk
+                is BuildResult.Success -> {
+                    exported = ApkExport.copyToProject(result.apk, project, variant).getOrNull()
+                    "BUILD SUCCESSFUL: ${result.apk.name}" to result.apk
+                }
                 is BuildResult.Failure -> "BUILD FAILED: ${result.reason}" to null
             }
-            _state.update { it.copy(building = false, buildLog = it.buildLog + summary, builtApk = apk) }
+            lastApk = apk
+            emit(summary)
+            exported?.let { emit("Copy: ${it.path}") }
+            if (apk != null && variant == BuildVariant.DEBUG) emit("(debug key: for testing only)")
+            if (apk != null && toTerminal) emit("Type 'install' to install it.")
+            _state.update { it.copy(building = false, builtApk = apk) }
         }
     }
+
+    @Volatile private var lastApk: File? = null
 
     fun cancelBuild() = engine.cancel()
 
@@ -558,6 +663,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private val termBuffer = TerminalBuffer()
     private val termHistory = CommandHistory()
     private var shell: ShellSession? = null
+    private var shellCwd: ShellCwd? = null
+    @Volatile private var builtinRunning = false
 
     fun toggleTerminal() {
         val visible = !_state.value.terminal.visible
@@ -568,6 +675,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private fun publishTerminal(running: Boolean = shell?.isRunning == true) {
         _state.update { it.copy(terminal = it.terminal.copy(text = termBuffer.text, running = running)) }
     }
+
+    private fun termPrint(text: String) { termBuffer.append(text); publishTerminal() }
 
     @Synchronized
     private fun startShell() {
@@ -594,7 +703,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         session.start()
             .onSuccess {
                 shell = session
-                termBuffer.append("MobileStudio terminal in ${dir.path}\nType 'build' to build the project, 'clear' to clear.\n")
+                shellCwd = ShellCwd(dir.canonicalFile, home)
+                termBuffer.append("MobileStudio terminal in ${dir.path}\nType 'help' for commands: build, build release, git ..., toolchain.\n")
                 publishTerminal(running = true)
             }
             .onFailure { termBuffer.append("Could not start shell: ${it.message}\n"); publishTerminal(running = false) }
@@ -603,6 +713,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private fun stopShell() {
         shell?.stop()
         shell = null
+        shellCwd = null
         termBuffer.clear()
     }
 
@@ -614,16 +725,116 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     fun terminalSend(line: String) {
         termHistory.add(line)
         termBuffer.append("$ $line\n")
-        when (TerminalCommands.parse(line)) {
+        when (val cmd = TerminalCommands.parse(line)) {
             BuiltinCommand.Clear -> { termBuffer.clear(); publishTerminal(); return }
-            BuiltinCommand.Build -> { publishTerminal(); build(); return }
+            BuiltinCommand.Build -> { publishTerminal(); build(BuildVariant.DEBUG, toTerminal = true); return }
+            BuiltinCommand.BuildRelease -> { publishTerminal(); build(BuildVariant.RELEASE, toTerminal = true); return }
+            BuiltinCommand.Help -> { termBuffer.append(TerminalCommands.HELP + "\n"); publishTerminal(); return }
+            BuiltinCommand.Install -> {
+                val apk = lastApk
+                termBuffer.append(if (apk?.isFile == true) "Opening the installer for ${apk.name}\n" else "Nothing to install yet. Run 'build' first.\n")
+                publishTerminal()
+                if (apk?.isFile == true) ApkInstaller.install(app, apk)
+                return
+            }
+            is BuiltinCommand.Invalid -> { termBuffer.append(cmd.message + "\n"); publishTerminal(); return }
+            is BuiltinCommand.Git -> { runBuiltin { runGit(cmd.args) }; return }
+            is BuiltinCommand.ToolchainCmd -> { runBuiltin { runToolchainCommand(cmd.args) }; return }
+            is BuiltinCommand.Keystore -> { runBuiltin { runKeystoreCommand(cmd.args) }; return }
             null -> Unit
         }
         val session = shell
         if (session == null || !session.send(line)) {
             termBuffer.append("[shell is not running - press restart]\n")
+        } else {
+            shellCwd?.observe(line)
         }
         publishTerminal()
+    }
+
+    /** Built-in commands may take a while (network); one at a time, off the main thread. */
+    private fun runBuiltin(block: () -> Unit) {
+        if (builtinRunning) { termPrint("Another command is still running. Wait for it to finish.\n"); return }
+        builtinRunning = true
+        publishTerminal()
+        viewModelScope.launch(Dispatchers.IO) {
+            try { block() } catch (e: Throwable) { termPrint("error: ${e.javaClass.simpleName}: ${e.message}\n") }
+            finally { builtinRunning = false; publishTerminal() }
+        }
+    }
+
+    private fun runGit(args: List<String>) {
+        val cwd = shellCwd?.current ?: _state.value.project ?: return
+        GitRunner(gitSettings) { termPrint(it) }.run(args, cwd)
+        // git may have changed files behind the editor's back: reload the tree and any tab without unsaved edits
+        viewModelScope.launch(Dispatchers.IO) {
+            refreshTree()
+            _state.update { s ->
+                s.copy(tabs = s.tabs.map { tab ->
+                    if (tab.dirty) tab
+                    else repo.read(tab.file).getOrNull()?.takeIf { it != tab.text }
+                        ?.let { tab.copy(text = it, savedText = it, undo = UndoStack(it), revision = tab.revision + 1) } ?: tab
+                })
+            }
+        }
+    }
+
+    private fun projectCompileSdk(): Int? {
+        val project = _state.value.project ?: return null
+        val module = runCatching { dev.mobilestudio.data.ModuleLocator.find(project) }.getOrNull() ?: return null
+        val script = listOf("build.gradle.kts", "build.gradle").map { File(module, it) }.firstOrNull { it.isFile } ?: return null
+        return dev.mobilestudio.build.GradleConfig.parse(script.readText()).getOrNull()?.compileSdk
+    }
+
+    private fun runToolchainCommand(args: List<String>) {
+        fun say(t: String) = termPrint(t + "\n")
+        when (args.firstOrNull() ?: "status") {
+            "status" -> {
+                val tc = currentToolchain()
+                say("aapt2:       " + if (tc.aapt2.isFile && tc.aapt2.canExecute()) "ready" else "missing")
+                say("android.jar: " + if (tc.androidJar.isFile) "ready" + (toolchainStore.androidJarApi?.let { " (API $it)" } ?: "") else "missing")
+                say("libraries:   " + tc.libs.joinToString(", ").ifEmpty { "none" })
+                say("aapt2 url:   " + (prefs.getString(PREF_AAPT2_URL, null)?.takeIf { it.isNotBlank() } ?: "(automatic)"))
+                if (tc.problems().isNotEmpty() || tc.libs.isEmpty()) say("Run 'toolchain setup' to download what is missing (a build does this on its own too).")
+            }
+            "setup" -> {
+                toolchainInstaller.ensure(projectCompileSdk(), needsKotlin = true) { say(it) }
+                    .onSuccess { say("Toolchain is ready.") }.onFailure { say("Could not finish:\n${it.message}") }
+                _state.update { it.copy(toolchain = readToolchainInfo()) }
+            }
+            "android-jar" -> {
+                val api = args.getOrNull(1)?.toIntOrNull() ?: run { say("usage: toolchain android-jar <api level, e.g. 35>"); return }
+                toolchainInstaller.installAndroidJar(api) { say(it) }.onFailure { say("failed: ${it.message}") }
+                _state.update { it.copy(toolchain = readToolchainInfo()) }
+            }
+            "aapt2-url" -> {
+                val url = args.getOrNull(1) ?: run { say("usage: toolchain aapt2-url <https://...>"); return }
+                setAapt2Url(url)
+                toolchainInstaller.installAapt2 { say(it) }.onSuccess { say("aapt2 is ready.") }.onFailure { say("failed: ${it.message}") }
+                _state.update { it.copy(toolchain = readToolchainInfo()) }
+            }
+            "reset-url" -> { setAapt2Url(""); say("aapt2 download address cleared.") }
+            else -> say("usage: toolchain status | setup | android-jar <api> | aapt2-url <url> | reset-url")
+        }
+    }
+
+    private fun runKeystoreCommand(args: List<String>) {
+        fun say(t: String) = termPrint(t + "\n")
+        val project = _state.value.project
+        when (args.firstOrNull() ?: "info") {
+            "info" -> {
+                say("Release builds sign with: " + releaseKeystore.describe(project))
+                say("To use your own key, put keystore.properties in the project folder:")
+                say("  storeFile=my.jks  storePassword=...  keyAlias=...  keyPassword=...")
+            }
+            "export" -> {
+                val dir = project?.let { File(it, "release-keys") } ?: return
+                releaseKeystore.export(dir)
+                    .onSuccess { say("Copied the release key to ${dir.path}\nKeep it safe and do NOT commit it: an app can only be updated with the same key.") }
+                    .onFailure { say("${it.message}") }
+            }
+            else -> say("usage: keystore info | export")
+        }
     }
 
     fun terminalHistoryPrevious(): String? = termHistory.previous()

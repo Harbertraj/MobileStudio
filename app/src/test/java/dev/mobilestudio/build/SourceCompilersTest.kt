@@ -7,7 +7,6 @@ import org.junit.Test
 import java.io.File
 import java.net.URLClassLoader
 import java.util.zip.ZipOutputStream
-import javax.tools.ToolProvider
 
 /** Uses the real Kotlin compiler and the JDK's javac (standing in for ECJ) on a desktop JVM. */
 class SourceCompilersTest {
@@ -19,10 +18,13 @@ class SourceCompilersTest {
     /** javac in place of ECJ, so the Kotlin-then-Java ordering can be checked without the ECJ library. */
     private class JavacRunner : JavaRunner {
         override fun compile(req: CompileRequest): StepResult {
-            val javac = ToolProvider.getSystemJavaCompiler() ?: return StepResult.Fail("no javac")
+            // javax.tools is not on the Android unit-test compile classpath (android.jar), so reach the JDK's javac by reflection.
+            val javac = runCatching { Class.forName("javax.tools.ToolProvider").getMethod("getSystemJavaCompiler").invoke(null) }.getOrNull()
+                ?: return StepResult.Fail("no javac")
+            val run = Class.forName("javax.tools.Tool").getMethod("run", java.io.InputStream::class.java, java.io.OutputStream::class.java, java.io.OutputStream::class.java, Array<String>::class.java)
             val cp = req.classpath.drop(1).joinToString(File.pathSeparator) { it.path } // drop the placeholder android.jar
             val args = listOf("-nowarn", "-proc:none", "-classpath", cp, "-d", req.outDir.path) + req.javaSources.map { it.path }
-            return if (javac.run(null, null, null, *args.toTypedArray()) == 0) StepResult.Ok else StepResult.Fail("javac failed")
+            return if (run.invoke(javac, null, null, null, args.toTypedArray()) == 0) StepResult.Ok else StepResult.Fail("javac failed")
         }
     }
 

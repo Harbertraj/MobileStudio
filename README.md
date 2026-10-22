@@ -9,28 +9,62 @@ An "Android Studio for Android": an IDE app that runs on the phone. Kotlin, Jetp
 - **Edit code**: file tree, tabs, line numbers, syntax colouring (Kotlin, Gradle, Java, XML), undo/redo,
   auto-indent and bracket pairing, word completion, find/replace (regex), search across the project,
   live warnings for unbalanced brackets and mismatched XML tags
-- **Terminal**: a persistent shell opened in the project folder (`cd` and variables persist). `build` runs
-  the project build, `clear` clears the screen. No pseudo-terminal: full-screen programs and Ctrl+C do not
-  work; the restart button ends a stuck command
+- **Terminal**: a persistent shell opened in the project folder (`cd` and variables persist), plus built-in
+  commands: `build`, `build release`, `install`, `toolchain`, `keystore`, `help` and a full **`git`** (see below).
+  No pseudo-terminal: full-screen programs and Ctrl+C do not work; the restart button ends a stuck command
 - **Build an APK**: reads `app/build.gradle(.kts)`, patches the manifest, runs aapt2, compiles Kotlin and Java,
   dexes with D8, packages (aligned), signs with a debug key, and offers Install
 
-## One-time setup on the phone: the build toolchain
+## Build toolchain (downloaded for you)
 
-An APK cannot be built from nothing. Open **Build toolchain** (the wrench on the home screen) and import:
+A build needs **aapt2**, **android.jar** (matching `compileSdk`) and, for Kotlin, **kotlin-stdlib**. You no longer
+have to find them: the build downloads what is missing as its first step ("Prepare toolchain"), and the wrench
+dialog has a **Download missing tools** button (terminal: `toolchain setup`).
 
-| File | What it is | Needed for |
-|---|---|---|
-| **aapt2** | the Android (aarch64) build of aapt2, an ELF executable | every build |
-| **android.jar** | from an SDK platform folder (`platforms/android-NN/android.jar`), matching `compileSdk` | every build |
-| **kotlin-stdlib-*.jar** | Kotlin standard library jar (find it in `~/.gradle/caches/modules-2/files-2.1/org.jetbrains.kotlin/kotlin-stdlib`) | Kotlin projects |
+| Piece | Downloaded from |
+|---|---|
+| kotlin-stdlib | Maven Central |
+| android.jar | Google's SDK repository (the platform package for your `compileSdk`; only `android.jar` is kept) |
+| aapt2 | an Android (aarch64) build in a GitHub release (`Lzhiyong/sdk-tools`), or **any address you give**: `toolchain aapt2-url <url>` or the field in the dialog. A `.zip`, `.tar.gz` or the bare binary all work |
 
-Imports are checked (an ELF file for aapt2, a jar containing `android/app/Activity.class` for android.jar).
-The build says exactly which piece is missing. I could not find or verify a download source for the aarch64
-aapt2 from the environment this was written in, so you need to supply that binary yourself.
+Every download goes through the same checks as a manual import (ELF with the right CPU, `Activity.class` inside
+android.jar, valid jar), and a downloaded aapt2 is run once (`aapt2 version`) before it is accepted. Manual import
+still works. If a download fails, the message says which piece and why.
 
-Only projects that use the plain Android framework build. Library dependencies (AppCompat, Compose, ...) are
-not resolved; the sample templates use only `android.app.Activity`.
+aapt2 is the one piece without an official Android build from Google. If the default source stops working,
+point `toolchain aapt2-url` at your own copy. Bundling it as `jniLibs/arm64-v8a/libaapt2.so` also works and wins.
+
+## Debug and release APKs
+
+- `build` / the play button: **debug**, signed with the shared public debug key (testing only)
+- `build release` / menu "Build release APK": D8 release mode, signed with a **release key**:
+  1. `keystore.properties` in the project folder (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`), or
+  2. otherwise a key **generated once on the device** and kept in the app's private storage
+- `keystore export` copies the device key and a ready `keystore.properties` into `<project>/release-keys/`.
+  Back it up and do not commit it: an installed app can only be updated by an APK signed with the same key
+- Finished APKs are copied to `<project>/build/outputs/apk/<debug|release>/`; `install` opens the installer
+
+## Git in the terminal
+
+There is no git binary on a phone, so `git` is built in (JGit). Supported: `init clone status add rm mv commit log
+diff show branch checkout switch restore reset merge rebase fetch pull push remote stash tag cherry-pick revert
+clean config ls-files`. Run `git help` for the options.
+
+```
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+git auth login <username> <personal-access-token>        # github.com; or: git auth login <host> <user> <token>
+git clone https://github.com/you/repo.git
+cd repo
+git add .                 # one command per line
+git commit -m "message"
+git push -u origin main
+```
+
+Limits: **HTTPS remotes only** (no SSH), no shallow clone (`--depth` is ignored), no hooks or submodules, nothing
+interactive (`rebase -i`, `add -p`). Git commands, `cd` and `build` must be typed on their own line (no pipes,
+`&&` or `;`); the app says so when you try. Tokens are kept in the app's private preferences. Git files on shared
+storage get `core.filemode=false` because that storage cannot hold the executable bit.
 
 ## Why the app targets API 28
 
@@ -43,14 +77,23 @@ revisit file access.
 
 ## Verification status (please read)
 
-Verified on a plain JVM (151 unit tests, `app/src/test`, compiled with Kotlin 2.0.21 and run with JUnit):
+Verified on a plain JVM (216 unit tests, `app/src/test`, compiled with Kotlin 2.0.21 and run with JUnit):
 the editor logic, folder browsing, path-confinement of file operations, toolchain import validation, the
 terminal against a real `sh` process, Gradle-config and manifest patching, APK packaging and 4-byte
 alignment (a deliberate break made the test fail), the pipeline orchestration (with a fake aapt2), and
 **mixed Kotlin + Java compilation with the real Kotlin compiler**, loading and running the output.
 The debug keystore asset is checked to decode to a usable RSA key.
 
+The downloader is tested against a local HTTP server (zip, tar.gz and bare binaries, redirects, wrong-CPU and
+broken binaries). The git commands are tested against real repositories, including clone/push/pull/rebase
+through a local bare remote. Release signing is tested with a self-made certificate and generated keystores.
+
 **Not run anywhere**, so treat as untested until you try it:
+
+- the real download sources over the internet (they were unreachable from the environment this was written in),
+  and that the downloaded aapt2 actually runs on your phone
+- JGit on Android (it is a standard Android-compatible release, but it was only exercised on a desktop JVM)
+- authenticated push to GitHub with a token (the transport was only exercised against a local remote)
 
 - the Compose screens (`ui/StudioApp.kt`, `ui/CodeEditor.kt`, `ui/Dialogs.kt`) and the Gradle build itself
   (there was no Android SDK or Maven access). They contain no syntax errors, but expect a few compile fixes on
@@ -76,8 +119,9 @@ The debug signing key (`assets/debug.p12.b64`) is public and shared. APKs signed
 app/src/main/java/dev/mobilestudio/
   data/      ProjectRepository, Templates, ProjectSearch, FolderBrowser (+RecentFolders, ModuleLocator)
   editor/    SyntaxHighlighter, UndoStack, AutoEdit, Completion, FindReplace, Diagnostics, TextPositions
-  terminal/  ShellSession, TerminalBuffer (+CommandHistory, TerminalCommands)
+  terminal/  ShellSession, TerminalBuffer (+CommandHistory, TerminalCommands), GitRunner, CommandLine, ShellCwd, GitPaths
   build/     BuildEngine, BuildPipeline, BuildSteps, SourceCompilers, K2KotlinRunner, EcjJavaRunner,
-             D8Dexer, ApkPackager, ApkSignerAdapter, ApkInstaller, Toolchain, ToolchainStore, ...
+             D8Dexer, ApkPackager, ApkSignerAdapter, ApkInstaller, Toolchain, ToolchainStore, ToolchainInstaller,
+             ReleaseKeystore, SelfSignedCert, ...
   ui/        StudioViewModel, StudioApp, CodeEditor, Dialogs
 ```

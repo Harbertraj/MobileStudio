@@ -18,11 +18,29 @@ class ToolchainStore(val dir: File) {
     fun libs(): List<File> =
         libsDir.listFiles { f -> f.isFile && f.extension == "jar" }?.sortedBy { it.name } ?: emptyList()
 
-    fun importAapt2(input: InputStream): Result<File> = runCatching {
+    /** API level of the imported android.jar when this app downloaded it; null when imported by hand. */
+    val androidJarApi: Int? get() = File(dir, "android.jar.api").takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull()
+
+    fun setAndroidJarApi(api: Int?) {
+        val f = File(dir, "android.jar.api")
+        if (api == null) f.delete() else { dir.mkdirs(); f.writeText(api.toString()) }
+    }
+
+    /**
+     * [expectedMachine] is the ELF e_machine the device needs (183 = AArch64, 40 = ARM, 62 = x86-64);
+     * a binary built for another CPU is refused here instead of failing with "exec format error" in the build.
+     */
+    fun importAapt2(input: InputStream, expectedMachine: Int? = null): Result<File> = runCatching {
         val bytes = input.use { it.readBytes() }
         require(bytes.size >= 4 && bytes[0] == 0x7F.toByte() && bytes[1] == 'E'.code.toByte() &&
             bytes[2] == 'L'.code.toByte() && bytes[3] == 'F'.code.toByte()) {
             "That file is not an ELF executable. Pick the aapt2 binary built for Android (aarch64)."
+        }
+        if (expectedMachine != null && bytes.size >= 20) {
+            val machine = (bytes[18].toInt() and 0xFF) or ((bytes[19].toInt() and 0xFF) shl 8)
+            require(machine == expectedMachine) {
+                "That aapt2 is built for ${ElfMachine.name(machine)}, but this device needs ${ElfMachine.name(expectedMachine)}."
+            }
         }
         dir.mkdirs()
         val tmp = File(dir, "aapt2.tmp").also { it.writeBytes(bytes) }
@@ -41,6 +59,7 @@ class ToolchainStore(val dir: File) {
         } catch (e: Exception) {
             tmp.delete(); throw e
         }
+        setAndroidJarApi(null) // imported by hand: which API level it is is unknown
         replace(tmp, androidJar)
     }
 
@@ -70,5 +89,28 @@ class ToolchainStore(val dir: File) {
         target.delete()
         check(tmp.renameTo(target)) { "Could not write ${target.name}" }
         return target
+    }
+}
+
+/** ELF machine numbers for the CPUs Android runs on. */
+object ElfMachine {
+    const val ARM = 40
+    const val X86_64 = 62
+    const val AARCH64 = 183
+
+    fun name(machine: Int) = when (machine) {
+        ARM -> "32-bit ARM"
+        X86_64 -> "x86-64"
+        AARCH64 -> "AArch64"
+        3 -> "x86"
+        else -> "machine $machine"
+    }
+
+    /** The machine this process runs on, or null when unknown (then no check is made). */
+    fun ofThisDevice(arch: String = System.getProperty("os.arch").orEmpty()): Int? = when (arch.lowercase()) {
+        "aarch64", "arm64", "armv8" -> AARCH64
+        "arm", "armv7l", "armv8l", "armeabi-v7a" -> ARM
+        "amd64", "x86_64" -> X86_64
+        else -> null
     }
 }

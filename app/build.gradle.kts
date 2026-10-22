@@ -45,7 +45,11 @@ android {
                 "META-INF/AL2.0", "META-INF/LGPL2.1", "META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA",
             )
             merges += setOf("META-INF/services/**")
-            pickFirsts += setOf("META-INF/*.kotlin_module", "META-INF/MANIFEST.MF", "about.html", "plugin.properties", "META-INF/eclipse.inf")
+            pickFirsts += setOf(
+                "META-INF/*.kotlin_module", "META-INF/MANIFEST.MF", "about.html", "plugin.properties", "META-INF/eclipse.inf",
+                // kotlin-stdlib and kotlin-compiler-embeddable both ship these
+                "**/*.kotlin_builtins", "**/*.kotlin_metadata", "kotlin/*.kotlin_builtins", "kotlin/*.kotlin_metadata",
+            )
         }
     }
     testOptions {

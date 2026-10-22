@@ -114,13 +114,69 @@ class CommandHistory(private val max: Int = 100) {
 /** Commands handled by the IDE instead of the shell. */
 sealed interface BuiltinCommand {
     data object Clear : BuiltinCommand
+
+    /** `build` / `build debug`. */
     data object Build : BuiltinCommand
+
+    /** `build release`. */
+    data object BuildRelease : BuiltinCommand
+
+    /** Opens the system installer for the last APK that was built. */
+    data object Install : BuiltinCommand
+    data object Help : BuiltinCommand
+
+    /** Built-in git (there is no git binary on the phone); [args] is everything after `git`. */
+    data class Git(val args: List<String>) : BuiltinCommand
+
+    /** `toolchain status|setup|android-jar <api>|aapt2-url <url>|...`. */
+    data class ToolchainCmd(val args: List<String>) : BuiltinCommand
+
+    /** `keystore info|export`. */
+    data class Keystore(val args: List<String>) : BuiltinCommand
+
+    /** A built-in that cannot work the way it was typed (for example git inside a pipe); [message] says why. */
+    data class Invalid(val message: String) : BuiltinCommand
 }
 
 object TerminalCommands {
-    fun parse(line: String): BuiltinCommand? = when (line.trim()) {
-        "clear" -> BuiltinCommand.Clear
-        "build" -> BuiltinCommand.Build
-        else -> null
+    fun parse(line: String): BuiltinCommand? {
+        val trimmed = line.trim()
+        val words = CommandLine.split(trimmed) ?: return null
+        val first = words.firstOrNull() ?: return null
+        val args = words.drop(1)
+        val builtin = first in setOf("clear", "build", "install", "help", "git", "toolchain", "keystore")
+        if (builtin && CommandLine.hasShellOperators(trimmed)) {
+            // `clear; ls` is a plain shell line; only the IDE-only commands explain why they cannot be chained.
+            return if (first in setOf("git", "toolchain", "keystore", "build"))
+                BuiltinCommand.Invalid("'$first' is built into MobileStudio and cannot be used with pipes, redirects, && or ;. Run it on its own line.")
+            else null
+        }
+        return when (first) {
+            "clear" -> if (args.isEmpty()) BuiltinCommand.Clear else null
+            "build" -> when {
+                args.isEmpty() -> BuiltinCommand.Build
+                args == listOf("debug") -> BuiltinCommand.Build
+                args == listOf("release") -> BuiltinCommand.BuildRelease
+                else -> null
+            }
+            "install" -> if (args.isEmpty()) BuiltinCommand.Install else null
+            "help" -> if (args.isEmpty()) BuiltinCommand.Help else null
+            "git" -> BuiltinCommand.Git(args)
+            "toolchain" -> BuiltinCommand.ToolchainCmd(args)
+            "keystore" -> BuiltinCommand.Keystore(args)
+            else -> null
+        }
     }
+
+    const val HELP = """Built-in commands
+  build [debug|release]   build an APK (release signs with your key; see 'keystore')
+  install                 install the last APK that was built
+  toolchain               status | setup | android-jar <api> | aapt2-url <url> | reset-url
+  keystore                info | export   (release signing key)
+  git <command>           built-in git: init clone status add rm mv commit log diff show
+                          branch checkout switch restore merge rebase fetch pull push
+                          remote reset stash tag cherry-pick revert clean config ls-files
+  git auth                login [host] <user> <token> | logout [host] | status
+  clear                   clear this screen
+Everything else runs in the shell (ls, cat, cd, ...). Run 'git help' for details."""
 }

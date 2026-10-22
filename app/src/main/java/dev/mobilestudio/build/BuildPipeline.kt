@@ -11,10 +11,11 @@ sealed interface StepResult {
 class BuildContext(
     val project: File,
     val workDir: File,
-    val toolchain: Toolchain,
+    var toolchain: Toolchain,
     val runner: ProcessRunner,
     val log: (String) -> Unit,
     val isCancelled: () -> Boolean,
+    val variant: BuildVariant = BuildVariant.DEBUG,
 ) {
     var config: AppConfig? = null
     var manifest: File? = null

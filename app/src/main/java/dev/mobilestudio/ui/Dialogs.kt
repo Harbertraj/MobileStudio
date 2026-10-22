@@ -30,6 +30,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -116,7 +118,7 @@ internal fun FolderPickerDialog(picker: FolderPickerState, vm: StudioViewModel) 
 }
 
 @Composable
-internal fun ToolchainDialog(info: ToolchainInfo, vm: StudioViewModel) {
+internal fun ToolchainDialog(info: ToolchainInfo, busy: Boolean, log: List<String>, aapt2Url: String, vm: StudioViewModel) {
     val context = LocalContext.current
     fun picker(kind: ToolKind) = { uri: Uri? ->
         if (uri != null) {
@@ -136,9 +138,31 @@ internal fun ToolchainDialog(info: ToolchainInfo, vm: StudioViewModel) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(
-                    "Building an APK needs files this app cannot download for you. Import them once; they are kept in the app's private storage.",
+                    "Building an APK needs aapt2, android.jar and (for Kotlin) kotlin-stdlib. The app downloads them for you, " +
+                        "and a build does it automatically when something is missing. They are kept in the app's private storage.",
                     style = MaterialTheme.typography.bodySmall,
                 )
+                Button(onClick = vm::downloadToolchain, enabled = !busy) {
+                    Text(if (busy) "Downloading..." else "Download missing tools")
+                }
+                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (log.isNotEmpty()) {
+                    Text(
+                        log.takeLast(12).joinToString("\n"),
+                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                    )
+                }
+                var url by remember(aapt2Url) { mutableStateOf(aapt2Url) }
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    singleLine = true,
+                    label = { Text("aapt2 download address (optional)") },
+                    supportingText = { Text("A .zip / .tar.gz containing the Android aarch64 aapt2, or the file itself. Empty = automatic.") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(onClick = { vm.setAapt2Url(url) }) { Text("Save address") }
+                Text("Or import files by hand:", style = MaterialTheme.typography.labelLarge)
                 ToolRow("aapt2 (Android, aarch64 build)", info.aapt2, "Import aapt2") { pickAapt2.launch(any) }
                 ToolRow("android.jar (SDK platform, matches compileSdk)", info.androidJar, "Import android.jar") { pickJar.launch(any) }
                 Text("Libraries (for example kotlin-stdlib-*.jar, required for Kotlin projects)", style = MaterialTheme.typography.labelLarge)

@@ -105,7 +105,7 @@ fun StudioApp(vm: StudioViewModel, dark: Boolean) {
     }
 
     state.folderPicker?.let { FolderPickerDialog(it, vm) }
-    if (state.toolchainDialog) ToolchainDialog(state.toolchain, vm)
+    if (state.toolchainDialog) ToolchainDialog(state.toolchain, state.toolchainBusy, state.toolchainLog, state.aapt2Url, vm)
 }
 
 // ---- home -----------------------------------------------------------------------------------
@@ -275,6 +275,16 @@ private fun ProjectScreen(state: StudioState, vm: StudioViewModel, dark: Boolean
                                     text = { Text("Search in project") },
                                     leadingIcon = { Icon(Icons.Default.Search, null) },
                                     onClick = { menu = false; vm.openSearch() },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Build debug APK") },
+                                    enabled = !state.building,
+                                    onClick = { menu = false; vm.build(dev.mobilestudio.build.BuildVariant.DEBUG) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Build release APK") },
+                                    enabled = !state.building,
+                                    onClick = { menu = false; vm.build(dev.mobilestudio.build.BuildVariant.RELEASE) },
                                 )
                                 if (state.building) {
                                     DropdownMenuItem(
